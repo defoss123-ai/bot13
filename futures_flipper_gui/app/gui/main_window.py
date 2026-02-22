@@ -40,6 +40,8 @@ class EngineActionThread(QThread):
         except Exception as exc:
             logger.exception(f"Engine action failed: {self.action}")
             self.done.emit(False, str(exc))
+        finally:
+            self.engine.storage.close_thread_connection()
 
 
 class MainWindow(QMainWindow):
@@ -144,6 +146,7 @@ class MainWindow(QMainWindow):
             self._engine_action_thread.wait(3000)
 
         self.engine.stop()
+        self.storage.close_thread_connection()
         event.accept()
 
     def _confirm_action(self, title: str, text: str) -> bool:

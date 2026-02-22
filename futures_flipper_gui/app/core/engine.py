@@ -43,7 +43,7 @@ class TradingEngine:
             self._stop_event.clear()
             self._thread = threading.Thread(target=self._run_loop, name="TradingEngineLoop", daemon=True)
             self._thread.start()
-            logger.info("Trading engine started")
+            logger.info("Engine started")
 
     def stop(self) -> None:
         with self._lock:
@@ -55,7 +55,8 @@ class TradingEngine:
         thread.join(timeout=5)
         with self._lock:
             self._thread = None
-        logger.info("Trading engine stopped")
+        self.storage.close_thread_connection()
+        logger.info("Engine stopped")
 
 
     def cancel_all_open_orders(self, symbol: str | None = None) -> int:
@@ -101,13 +102,16 @@ class TradingEngine:
         logger.warning(f"Panic stop completed: canceled {canceled} open orders")
 
     def _run_loop(self) -> None:
-        while not self._stop_event.is_set():
-            interval = self._setting_int("check_interval_sec", 5, minimum=1)
-            try:
-                self._loop_iteration()
-            except Exception:
-                logger.exception("Engine loop error")
-            self._stop_event.wait(interval)
+        try:
+            while not self._stop_event.is_set():
+                interval = self._setting_int("check_interval_sec", 5, minimum=1)
+                try:
+                    self._loop_iteration()
+                except Exception:
+                    logger.exception("Engine loop error")
+                self._stop_event.wait(interval)
+        finally:
+            self.storage.close_thread_connection()
 
 
     def _safe_state_sync(self) -> None:
@@ -265,6 +269,7 @@ class TradingEngine:
                 order_id = "paper-entry"
                 entry_status = "paper"
             else:
+                logger.info(f"Placing entry order {item['symbol']} amount={amount:.8f} side=buy")
                 result = place_entry(
                     symbol=item["symbol"],
                     side="buy",
@@ -281,6 +286,10 @@ class TradingEngine:
                 filled = float(result.filled)
                 order_id = result.order_id or ""
                 entry_status = result.status
+                if entry_success:
+                    logger.info(
+                        f"Order filled {item['symbol']} qty={filled:.8f} avg_price={entry_price:.8f} status={entry_status}"
+                    )
 
             if not entry_success:
                 continue

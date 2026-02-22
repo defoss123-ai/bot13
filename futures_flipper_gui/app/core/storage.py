@@ -1,8 +1,9 @@
+import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-import json
 
 
 DB_DIR = Path(__file__).resolve().parents[2] / "data"
@@ -161,25 +162,57 @@ def init_db() -> sqlite3.Connection:
 
 
 class Storage:
-    def __init__(self, conn: sqlite3.Connection | None = None) -> None:
-        self.conn = conn if conn is not None else init_db()
-        self.conn.row_factory = sqlite3.Row
+    def __init__(self, conn: sqlite3.Connection | None = None, db_path: Path | str | None = None) -> None:
+        # keep API compatibility with previous constructor, but do not share one sqlite connection across threads
+        if db_path is not None:
+            self.db_path = Path(db_path)
+        else:
+            self.db_path = DB_PATH
+
+        self._local = threading.local()
+
+        if conn is not None:
+            # if external connection was passed, use its database path for per-thread connections
+            path_row = conn.execute("PRAGMA database_list").fetchone()
+            if path_row and len(path_row) >= 3 and path_row[2]:
+                self.db_path = Path(path_row[2])
+            conn.close()
+
+        bootstrap = init_db()
+        bootstrap.close()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            self._local.conn = conn
+        return conn
+
+    def close_thread_connection(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            del self._local.conn
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
-        row = self.conn.execute(
-            "SELECT value FROM settings WHERE key = ?", (key,)
-        ).fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
 
     def set_setting(self, key: str, value: Any) -> None:
-        self.conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
             (key, str(value)),
         )
-        self.conn.commit()
+        conn.commit()
 
     def list_pairs(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute("SELECT * FROM pairs ORDER BY symbol").fetchall()
+        conn = self._get_conn()
+        rows = conn.execute("SELECT * FROM pairs ORDER BY symbol").fetchall()
         return [dict(row) for row in rows]
 
     def upsert_pair(
@@ -191,7 +224,8 @@ class Storage:
         enabled: int,
         cooldown_sec: int,
     ) -> None:
-        self.conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             """
             INSERT INTO pairs(symbol, leverage, tp_pct, sl_pct, enabled, cooldown_sec)
             VALUES(?, ?, ?, ?, ?, ?)
@@ -204,20 +238,21 @@ class Storage:
             """,
             (symbol, leverage, tp_pct, sl_pct, enabled, cooldown_sec),
         )
-        self.conn.commit()
+        conn.commit()
 
     def delete_pair(self, symbol: str) -> None:
-        self.conn.execute("DELETE FROM pairs WHERE symbol = ?", (symbol,))
-        self.conn.commit()
+        conn = self._get_conn()
+        conn.execute("DELETE FROM pairs WHERE symbol = ?", (symbol,))
+        conn.commit()
 
     def get_api_keys(self, exchange: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT * FROM api_keys WHERE exchange = ?", (exchange,)
-        ).fetchone()
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM api_keys WHERE exchange = ?", (exchange,)).fetchone()
         return dict(row) if row else None
 
     def set_api_keys(self, exchange: str, api_key: str, api_secret: str) -> None:
-        self.conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             """
             INSERT INTO api_keys(exchange, api_key, api_secret, created_at)
             VALUES(?, ?, ?, ?)
@@ -228,7 +263,7 @@ class Storage:
             """,
             (exchange, api_key, api_secret, _utc_now_iso()),
         )
-        self.conn.commit()
+        conn.commit()
 
     def insert_trade(
         self,
@@ -242,20 +277,20 @@ class Storage:
         mode: str,
         reason: str,
     ) -> int:
-        cursor = self.conn.execute(
+        conn = self._get_conn()
+        cursor = conn.execute(
             """
             INSERT INTO trades(ts, symbol, side, qty, entry, exit, pnl, mode, reason)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (ts, symbol, side, qty, entry, exit, pnl, mode, reason),
         )
-        self.conn.commit()
+        conn.commit()
         return int(cursor.lastrowid)
 
     def list_trades(self, limit: int = 200) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+        conn = self._get_conn()
+        rows = conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
     def insert_order(
@@ -267,29 +302,28 @@ class Storage:
         status: str,
         meta_json: str,
     ) -> int:
-        cursor = self.conn.execute(
+        conn = self._get_conn()
+        cursor = conn.execute(
             """
             INSERT INTO orders(ts, symbol, kind, order_id, status, meta_json)
             VALUES(?, ?, ?, ?, ?, ?)
             """,
             (ts, symbol, kind, order_id, status, meta_json),
         )
-        self.conn.commit()
+        conn.commit()
         return int(cursor.lastrowid)
 
     def update_order_status(self, order_id: str, status: str) -> None:
-        self.conn.execute(
-            "UPDATE orders SET status = ? WHERE order_id = ?",
-            (status, order_id),
-        )
-        self.conn.commit()
+        conn = self._get_conn()
+        conn.execute("UPDATE orders SET status = ? WHERE order_id = ?", (status, order_id))
+        conn.commit()
 
     def list_open_orders(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
+        conn = self._get_conn()
+        rows = conn.execute(
             "SELECT * FROM orders WHERE status NOT IN ('closed', 'canceled') ORDER BY id DESC"
         ).fetchall()
         return [dict(row) for row in rows]
-
 
     def upsert_position(
         self,
@@ -301,7 +335,8 @@ class Storage:
         status: str,
         meta_json: str,
     ) -> None:
-        self.conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             """
             INSERT INTO positions(symbol, side, amount, entry_price, unrealized_pnl, status, meta_json, updated_at)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?)
@@ -316,46 +351,49 @@ class Storage:
             """,
             (symbol, side, amount, entry_price, unrealized_pnl, status, meta_json, _utc_now_iso()),
         )
-        self.conn.commit()
+        conn.commit()
 
     def list_positions(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute("SELECT * FROM positions ORDER BY symbol").fetchall()
+        conn = self._get_conn()
+        rows = conn.execute("SELECT * FROM positions ORDER BY symbol").fetchall()
         return [dict(row) for row in rows]
 
     def delete_positions_not_in(self, symbols: list[str]) -> None:
+        conn = self._get_conn()
         if not symbols:
-            self.conn.execute("DELETE FROM positions")
-            self.conn.commit()
+            conn.execute("DELETE FROM positions")
+            conn.commit()
             return
 
         placeholders = ",".join("?" for _ in symbols)
-        self.conn.execute(f"DELETE FROM positions WHERE symbol NOT IN ({placeholders})", tuple(symbols))
-        self.conn.commit()
+        conn.execute(f"DELETE FROM positions WHERE symbol NOT IN ({placeholders})", tuple(symbols))
+        conn.commit()
 
     def delete_open_orders_not_in(self, order_ids: list[str]) -> None:
+        conn = self._get_conn()
         if not order_ids:
-            self.conn.execute("DELETE FROM orders WHERE status NOT IN ('closed', 'canceled')")
-            self.conn.commit()
+            conn.execute("DELETE FROM orders WHERE status NOT IN ('closed', 'canceled')")
+            conn.commit()
             return
 
         placeholders = ",".join("?" for _ in order_ids)
-        self.conn.execute(
+        conn.execute(
             f"DELETE FROM orders WHERE status NOT IN ('closed', 'canceled') AND order_id NOT IN ({placeholders})",
             tuple(order_ids),
         )
-        self.conn.commit()
+        conn.commit()
 
     def list_zero_fee_symbols(self) -> list[str]:
-        rows = self.conn.execute(
-            "SELECT symbol FROM zero_fee_symbols WHERE enabled = 1 ORDER BY symbol"
-        ).fetchall()
+        conn = self._get_conn()
+        rows = conn.execute("SELECT symbol FROM zero_fee_symbols WHERE enabled = 1 ORDER BY symbol").fetchall()
         return [str(row["symbol"]) for row in rows]
 
     def set_zero_fee_symbol(self, symbol: str, enabled: int) -> None:
         normalized = symbol.strip().upper()
         if not normalized:
             return
-        self.conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             """
             INSERT INTO zero_fee_symbols(symbol, enabled, updated_at)
             VALUES(?, ?, ?)
@@ -365,7 +403,7 @@ class Storage:
             """,
             (normalized, int(enabled), _utc_now_iso()),
         )
-        self.conn.commit()
+        conn.commit()
 
     def import_zero_fee_symbols(self, symbols: list[str]) -> None:
         payload = [
@@ -375,7 +413,8 @@ class Storage:
         ]
         if not payload:
             return
-        self.conn.executemany(
+        conn = self._get_conn()
+        conn.executemany(
             """
             INSERT INTO zero_fee_symbols(symbol, enabled, updated_at)
             VALUES(?, ?, ?)
@@ -385,4 +424,4 @@ class Storage:
             """,
             payload,
         )
-        self.conn.commit()
+        conn.commit()
