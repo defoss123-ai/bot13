@@ -249,6 +249,17 @@ class TradingEngine:
                 margin_usdt=margin_usdt,
                 leverage=int(item["leverage"]),
                 market_info=item.get("market_info") or {},
+                symbol=item["symbol"],
+                client=client,
+            )
+
+            logger.info(
+                "Market limits resolved: min_qty=%s step=%s precision=%s"
+                % (
+                    sizing_details.get("min_qty"),
+                    sizing_details.get("step"),
+                    sizing_details.get("precision_amount"),
+                )
             )
 
             logger.info(
