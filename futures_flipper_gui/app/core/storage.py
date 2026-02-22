@@ -9,6 +9,69 @@ from typing import Any
 DB_DIR = Path(__file__).resolve().parents[2] / "data"
 DB_PATH = DB_DIR / "app.db"
 
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS api_keys(
+  exchange TEXT PRIMARY KEY,
+  api_key TEXT,
+  api_secret TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pairs(
+  symbol TEXT PRIMARY KEY,
+  leverage INT,
+  tp_pct REAL,
+  sl_pct REAL,
+  enabled INT,
+  cooldown_sec INT
+);
+
+CREATE TABLE IF NOT EXISTS settings(
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS trades(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT,
+  symbol TEXT,
+  side TEXT,
+  qty REAL,
+  entry REAL,
+  exit REAL,
+  pnl REAL,
+  mode TEXT,
+  reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS orders(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT,
+  symbol TEXT,
+  kind TEXT,
+  order_id TEXT,
+  status TEXT,
+  meta_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS positions(
+  symbol TEXT PRIMARY KEY,
+  side TEXT,
+  amount REAL,
+  entry_price REAL,
+  unrealized_pnl REAL,
+  status TEXT,
+  meta_json TEXT,
+  updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS zero_fee_symbols(
+  symbol TEXT PRIMARY KEY,
+  enabled INT,
+  updated_at TEXT
+);
+"""
+
 DEFAULT_SETTINGS: dict[str, str] = {
     "check_interval_sec": "5",
     "max_concurrent_positions": "1",
@@ -82,114 +145,59 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
+
+
 def init_db() -> sqlite3.Connection:
     """Create SQLite database, required tables, and default settings."""
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS api_keys(
-          exchange TEXT PRIMARY KEY,
-          api_key TEXT,
-          api_secret TEXT,
-          created_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS pairs(
-          symbol TEXT PRIMARY KEY,
-          leverage INT,
-          tp_pct REAL,
-          sl_pct REAL,
-          enabled INT,
-          cooldown_sec INT
-        );
-
-        CREATE TABLE IF NOT EXISTS settings(
-          key TEXT PRIMARY KEY,
-          value TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS trades(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT,
-          symbol TEXT,
-          side TEXT,
-          qty REAL,
-          entry REAL,
-          exit REAL,
-          pnl REAL,
-          mode TEXT,
-          reason TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS orders(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT,
-          symbol TEXT,
-          kind TEXT,
-          order_id TEXT,
-          status TEXT,
-          meta_json TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS positions(
-          symbol TEXT PRIMARY KEY,
-          side TEXT,
-          amount REAL,
-          entry_price REAL,
-          unrealized_pnl REAL,
-          status TEXT,
-          meta_json TEXT,
-          updated_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS zero_fee_symbols(
-          symbol TEXT PRIMARY KEY,
-          enabled INT,
-          updated_at TEXT
-        );
-        """
-    )
-
+    conn = _connect(DB_PATH)
+    conn.executescript(SCHEMA_SQL)
     conn.executemany(
         "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
         list(DEFAULT_SETTINGS.items()),
     )
-
-    conn.commit()
     return conn
 
 
 class Storage:
     def __init__(self, conn: sqlite3.Connection | None = None, db_path: Path | str | None = None) -> None:
-        # keep API compatibility with previous constructor, but do not share one sqlite connection across threads
         if db_path is not None:
             self.db_path = Path(db_path)
+        elif conn is not None:
+            row = conn.execute("PRAGMA database_list").fetchone()
+            self.db_path = Path(row[2]) if row and row[2] else DB_PATH
+            conn.close()
         else:
             self.db_path = DB_PATH
 
+        # Thread-local DB handle: each thread gets its own sqlite connection.
         self._local = threading.local()
+        self._ensure_schema()
 
-        if conn is not None:
-            # if external connection was passed, use its database path for per-thread connections
-            path_row = conn.execute("PRAGMA database_list").fetchone()
-            if path_row and len(path_row) >= 3 and path_row[2]:
-                self.db_path = Path(path_row[2])
-            conn.close()
-
-        bootstrap = init_db()
-        bootstrap.close()
-
-    def _get_conn(self) -> sqlite3.Connection:
+    def _conn(self) -> sqlite3.Connection:
+        """Return per-thread sqlite connection; never shared across threads."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn = _connect(self.db_path)
             self._local.conn = conn
         return conn
+
+    def _ensure_schema(self) -> None:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+        conn = self._conn()
+        conn.executescript(SCHEMA_SQL)
+        conn.executemany(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+            list(DEFAULT_SETTINGS.items()),
+        )
+        conn.commit()
 
     def close_thread_connection(self) -> None:
         conn = getattr(self._local, "conn", None)
@@ -198,12 +206,12 @@ class Storage:
             del self._local.conn
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
-        conn = self._get_conn()
+        conn = self._conn()
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
 
     def set_setting(self, key: str, value: Any) -> None:
-        conn = self._get_conn()
+        conn = self._conn()
         conn.execute(
             "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
             (key, str(value)),
@@ -211,7 +219,7 @@ class Storage:
         conn.commit()
 
     def list_pairs(self) -> list[dict[str, Any]]:
-        conn = self._get_conn()
+        conn = self._conn()
         rows = conn.execute("SELECT * FROM pairs ORDER BY symbol").fetchall()
         return [dict(row) for row in rows]
 
@@ -224,7 +232,7 @@ class Storage:
         enabled: int,
         cooldown_sec: int,
     ) -> None:
-        conn = self._get_conn()
+        conn = self._conn()
         conn.execute(
             """
             INSERT INTO pairs(symbol, leverage, tp_pct, sl_pct, enabled, cooldown_sec)
@@ -241,17 +249,17 @@ class Storage:
         conn.commit()
 
     def delete_pair(self, symbol: str) -> None:
-        conn = self._get_conn()
+        conn = self._conn()
         conn.execute("DELETE FROM pairs WHERE symbol = ?", (symbol,))
         conn.commit()
 
     def get_api_keys(self, exchange: str) -> dict[str, Any] | None:
-        conn = self._get_conn()
+        conn = self._conn()
         row = conn.execute("SELECT * FROM api_keys WHERE exchange = ?", (exchange,)).fetchone()
         return dict(row) if row else None
 
     def set_api_keys(self, exchange: str, api_key: str, api_secret: str) -> None:
-        conn = self._get_conn()
+        conn = self._conn()
         conn.execute(
             """
             INSERT INTO api_keys(exchange, api_key, api_secret, created_at)
@@ -277,7 +285,7 @@ class Storage:
         mode: str,
         reason: str,
     ) -> int:
-        conn = self._get_conn()
+        conn = self._conn()
         cursor = conn.execute(
             """
             INSERT INTO trades(ts, symbol, side, qty, entry, exit, pnl, mode, reason)
@@ -289,7 +297,7 @@ class Storage:
         return int(cursor.lastrowid)
 
     def list_trades(self, limit: int = 200) -> list[dict[str, Any]]:
-        conn = self._get_conn()
+        conn = self._conn()
         rows = conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
@@ -302,7 +310,7 @@ class Storage:
         status: str,
         meta_json: str,
     ) -> int:
-        conn = self._get_conn()
+        conn = self._conn()
         cursor = conn.execute(
             """
             INSERT INTO orders(ts, symbol, kind, order_id, status, meta_json)
@@ -314,12 +322,12 @@ class Storage:
         return int(cursor.lastrowid)
 
     def update_order_status(self, order_id: str, status: str) -> None:
-        conn = self._get_conn()
+        conn = self._conn()
         conn.execute("UPDATE orders SET status = ? WHERE order_id = ?", (status, order_id))
         conn.commit()
 
     def list_open_orders(self) -> list[dict[str, Any]]:
-        conn = self._get_conn()
+        conn = self._conn()
         rows = conn.execute(
             "SELECT * FROM orders WHERE status NOT IN ('closed', 'canceled') ORDER BY id DESC"
         ).fetchall()
@@ -335,7 +343,7 @@ class Storage:
         status: str,
         meta_json: str,
     ) -> None:
-        conn = self._get_conn()
+        conn = self._conn()
         conn.execute(
             """
             INSERT INTO positions(symbol, side, amount, entry_price, unrealized_pnl, status, meta_json, updated_at)
@@ -354,12 +362,12 @@ class Storage:
         conn.commit()
 
     def list_positions(self) -> list[dict[str, Any]]:
-        conn = self._get_conn()
+        conn = self._conn()
         rows = conn.execute("SELECT * FROM positions ORDER BY symbol").fetchall()
         return [dict(row) for row in rows]
 
     def delete_positions_not_in(self, symbols: list[str]) -> None:
-        conn = self._get_conn()
+        conn = self._conn()
         if not symbols:
             conn.execute("DELETE FROM positions")
             conn.commit()
@@ -370,7 +378,7 @@ class Storage:
         conn.commit()
 
     def delete_open_orders_not_in(self, order_ids: list[str]) -> None:
-        conn = self._get_conn()
+        conn = self._conn()
         if not order_ids:
             conn.execute("DELETE FROM orders WHERE status NOT IN ('closed', 'canceled')")
             conn.commit()
@@ -384,7 +392,7 @@ class Storage:
         conn.commit()
 
     def list_zero_fee_symbols(self) -> list[str]:
-        conn = self._get_conn()
+        conn = self._conn()
         rows = conn.execute("SELECT symbol FROM zero_fee_symbols WHERE enabled = 1 ORDER BY symbol").fetchall()
         return [str(row["symbol"]) for row in rows]
 
@@ -392,7 +400,7 @@ class Storage:
         normalized = symbol.strip().upper()
         if not normalized:
             return
-        conn = self._get_conn()
+        conn = self._conn()
         conn.execute(
             """
             INSERT INTO zero_fee_symbols(symbol, enabled, updated_at)
@@ -413,7 +421,7 @@ class Storage:
         ]
         if not payload:
             return
-        conn = self._get_conn()
+        conn = self._conn()
         conn.executemany(
             """
             INSERT INTO zero_fee_symbols(symbol, enabled, updated_at)

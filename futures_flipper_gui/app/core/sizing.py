@@ -27,68 +27,55 @@ def compute_order_amount(
     margin_usdt: float,
     leverage: int,
     market_info: dict[str, Any] | None = None,
-) -> tuple[float | None, list[str]]:
-    warnings: list[str] = []
-
+) -> tuple[float | None, str | None, dict[str, float | None]]:
     if price <= 0:
         raise ValueError("price must be > 0")
     if leverage <= 0:
         raise ValueError("leverage must be > 0")
-    if margin_usdt <= 0:
-        return None, ["Non-positive margin"]
 
-    notional = float(margin_usdt) * float(leverage)
-    raw_amount = notional / float(price)
+    market = market_info or {}
+    limits = market.get("limits") or {}
+    precision = market.get("precision") or {}
 
-    limits = (market_info or {}).get("limits") or {}
-    precision = (market_info or {}).get("precision") or {}
-
+    min_qty = _nested_float(limits, "amount", "min")
+    min_cost = _nested_float(limits, "cost", "min")
     amount_precision = precision.get("amount")
     amount_step = _nested_float(limits, "amount", "step")
-    min_amount = _nested_float(limits, "amount", "min")
-    max_amount = _nested_float(limits, "amount", "max")
 
-    adjusted_amount, changed = apply_precision(raw_amount, precision=amount_precision, step=amount_step)
-    if changed:
-        warnings.append("Precision adjusted")
+    qty_raw = 0.0
+    qty_rounded = 0.0
 
-    if adjusted_amount <= 0:
-        return None, warnings + ["Amount became zero after precision"]
+    if margin_usdt <= 0:
+        details = {
+            "qty_raw": qty_raw,
+            "qty_rounded": qty_rounded,
+            "min_qty": min_qty,
+            "min_cost": min_cost,
+            "cost": 0.0,
+        }
+        return None, "Non-positive margin", details
 
-    if min_amount is not None and adjusted_amount < min_amount:
-        return None, warnings + [f"Below min amount ({adjusted_amount} < {min_amount})"]
+    notional = float(margin_usdt) * float(leverage)
+    qty_raw = notional / float(price)
+    qty_rounded, _ = apply_precision(qty_raw, precision=amount_precision, step=amount_step)
 
-    if max_amount is not None and adjusted_amount > max_amount:
-        adjusted_amount = max_amount
-        adjusted_amount, changed_max = apply_precision(adjusted_amount, precision=amount_precision, step=amount_step)
-        if changed_max:
-            warnings.append("Clamped to max amount")
+    cost = qty_rounded * float(price)
+    details = {
+        "qty_raw": qty_raw,
+        "qty_rounded": qty_rounded,
+        "min_qty": min_qty,
+        "min_cost": min_cost,
+        "cost": cost,
+    }
 
-    price_precision = precision.get("price")
-    price_step = _nested_float(limits, "price", "step")
-    adjusted_price, price_changed = apply_precision(float(price), precision=price_precision, step=price_step)
-    if price_changed:
-        warnings.append("Price precision adjusted")
-
-    cost = adjusted_amount * adjusted_price
-    min_cost = _nested_float(limits, "cost", "min")
-    max_cost = _nested_float(limits, "cost", "max")
-
+    if qty_rounded <= 0:
+        return None, "qty_after_round <= 0", details
+    if min_qty is not None and qty_rounded < min_qty:
+        return None, f"qty_rounded < minQty ({qty_rounded} < {min_qty})", details
     if min_cost is not None and cost < min_cost:
-        return None, warnings + [f"Below min cost ({cost} < {min_cost})"]
+        return None, f"notional < minCost ({cost} < {min_cost})", details
 
-    if max_cost is not None and cost > max_cost:
-        target_amount = max_cost / adjusted_price
-        adjusted_amount, changed_cost = apply_precision(target_amount, precision=amount_precision, step=amount_step)
-        if changed_cost:
-            warnings.append("Adjusted by max cost")
-        if adjusted_amount <= 0:
-            return None, warnings + ["Amount became zero after max cost adjustment"]
-
-    if min_amount is not None and adjusted_amount < min_amount:
-        return None, warnings + [f"Below min amount ({adjusted_amount} < {min_amount})"]
-
-    return adjusted_amount, warnings
+    return qty_rounded, None, details
 
 
 def apply_precision(amount: float, precision: int | float | None = None, step: float | None = None) -> tuple[float, bool]:

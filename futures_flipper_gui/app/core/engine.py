@@ -215,6 +215,7 @@ class TradingEngine:
 
                 if result.signal:
                     reason = "; ".join(result.reasons)
+                    logger.info(f"Signal {symbol} reasons={reason} score={result.score}")
                     market_info = (client.exchange.markets or {}).get(swap_symbol, {})
                     candidates.append(
                         {
@@ -243,20 +244,32 @@ class TradingEngine:
 
         for item in selected:
             margin_usdt = compute_margin_to_use(free_balance, sizing_settings)
-            amount, sizing_warnings = compute_order_amount(
+            amount, sizing_error, sizing_details = compute_order_amount(
                 price=float(item["price"]),
                 margin_usdt=margin_usdt,
                 leverage=int(item["leverage"]),
                 market_info=item.get("market_info") or {},
             )
 
-            if amount is None:
-                warning_text = "; ".join(sizing_warnings) if sizing_warnings else "invalid amount"
-                logger.warning(f"Skip {item['symbol']}: {warning_text}")
-                continue
+            logger.info(
+                "Sizing: mode=%s margin_usdt=%.4f price=%.8f qty_raw=%.8f qty_rounded=%.8f minQty=%s minCost=%s"
+                % (
+                    sizing_settings.get("sizing_mode", "percent"),
+                    margin_usdt,
+                    float(item["price"]),
+                    float(sizing_details.get("qty_raw") or 0.0),
+                    float(sizing_details.get("qty_rounded") or 0.0),
+                    sizing_details.get("min_qty"),
+                    sizing_details.get("min_cost"),
+                )
+            )
 
-            if sizing_warnings:
-                logger.info(f"Sizing notes {item['symbol']}: {'; '.join(sizing_warnings)}")
+            if amount is None:
+                logger.warning(
+                    f"Cannot enter {item['symbol']}: qty too small after precision/minQty/minCost. "
+                    f"Increase sizing_fixed_usdt/sizing_percent or lower reserve. ({sizing_error})"
+                )
+                continue
 
             if paper_mode:
                 logger.info(
