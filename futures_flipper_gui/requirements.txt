@@ -1,0 +1,4 @@
+PyQt5>=5.15
+ccxt>=4.0.0
+pydantic>=2.0.0
+loguru>=0.7.0
